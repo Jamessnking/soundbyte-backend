@@ -16,10 +16,10 @@ from routes.audio import router as audio_router
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# MongoDB connection (optional — not required for audio processing)
+mongo_url = os.environ.get('MONGO_URL', '')
+client = AsyncIOMotorClient(mongo_url) if mongo_url else None
+db = client[os.environ.get('DB_NAME', 'soundbyte')] if client else None
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -40,17 +40,20 @@ class StatusCheckCreate(BaseModel):
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "SoundByte API running"}
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     status_dict = input.dict()
     status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
+    if db is not None:
+        _ = await db.status_checks.insert_one(status_obj.dict())
     return status_obj
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
+    if db is None:
+        return []
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**status_check) for status_check in status_checks]
 
@@ -81,4 +84,5 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client is not None:
+        client.close()
