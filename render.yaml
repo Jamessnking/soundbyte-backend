@@ -1,0 +1,17 @@
+# One-click Render.com deploy manifest for the SoundByte backend.
+services:
+  - type: web
+    name: soundbyte-backend
+    env: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: soundbyte
+      - key: PYTHONUNBUFFERED
+        value: "1"
