@@ -41,6 +41,9 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 # 10 clips max for merge, matches the app's Pro limit (Free is 3, enforced
 # client-side).
 MAX_MERGE_CLIPS = 10
+# Combined duration cap for a merge. Keeps a 10-clip job inside the public
+# HTTP connection window (jobs over ~4.5 minutes were cut off).
+MAX_MERGE_TOTAL_SECONDS = 5400
 # Per-ffmpeg-call cap so runaway inputs can't lock a worker forever. A 45-min
 # input takes ~20 CPU-seconds, so 15 minutes leaves big headroom even on a
 # 0.5 CPU instance or when two jobs share the CPU.
@@ -58,6 +61,7 @@ def _slots() -> asyncio.Semaphore:
     return _ffmpeg_slots
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
 
 
 def _job_dir() -> Path:
@@ -130,6 +134,54 @@ async def _run_ffmpeg(args: List[str]) -> None:
             status_code=422,
             detail=f"FFmpeg error: {stderr[-300:] or 'unknown failure'}",
         )
+
+
+async def _probe_duration(path: Path) -> float:
+    """Return the clip duration in seconds via ffprobe, without blocking."""
+    cmd = [
+        FFPROBE_BIN,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read clip duration",
+        ) from exc
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read clip duration",
+        )
+    raw = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+    try:
+        duration = float(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read clip duration",
+        )
+    if duration <= 0 or duration != duration:  # NaN
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read clip duration",
+        )
+    return duration
 
 
 def _mp3_response(path: Path, filename: str, background: BackgroundTasks, job: Path) -> FileResponse:
@@ -270,6 +322,24 @@ async def merge_audio(
             dst = job / f"clip-{idx:02d}{suffix}"
             await _save_upload(upload, dst)
             saved.append(dst)
+
+        # 1b. Reject merges whose combined duration exceeds 90 minutes,
+        #     before any expensive ffmpeg work.
+        total_seconds = 0.0
+        for src in saved:
+            total_seconds += await _probe_duration(src)
+        if total_seconds > MAX_MERGE_TOTAL_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "merge_too_long",
+                    "message": (
+                        "Merges are limited to 90 minutes in total. "
+                        "Please remove or shorten some clips."
+                    ),
+                    "max_seconds": MAX_MERGE_TOTAL_SECONDS,
+                },
+            )
 
         # 2. Normalise every clip to the same PCM layout via a first pass so
         #    the concat demuxer never sees codec/sample-rate mismatches.
