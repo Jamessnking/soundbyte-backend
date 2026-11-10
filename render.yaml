@@ -3,7 +3,7 @@ services:
   - type: web
     name: soundbyte-backend
     env: docker
-    plan: free
+    plan: standard
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
