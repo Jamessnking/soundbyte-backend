@@ -13,6 +13,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -37,10 +38,24 @@ logger = logging.getLogger(__name__)
 
 # 100 MB per upload matches the client-side guard.
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
-# 6 clips max for merge, matches the UI.
-MAX_MERGE_CLIPS = 6
-# Absolute ffmpeg cap so runaway inputs can't lock a worker forever.
-FFMPEG_TIMEOUT_SECONDS = 180
+# 10 clips max for merge, matches the app's Pro limit (Free is 3, enforced
+# client-side).
+MAX_MERGE_CLIPS = 10
+# Per-ffmpeg-call cap so runaway inputs can't lock a worker forever. A 45-min
+# input takes ~20 CPU-seconds, so 15 minutes leaves big headroom even on a
+# 0.5 CPU instance or when two jobs share the CPU.
+FFMPEG_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "900"))
+# How many ffmpeg processes may run at once. Extra jobs wait their turn
+# instead of fighting over a small CPU.
+MAX_CONCURRENT_FFMPEG = int(os.environ.get("MAX_CONCURRENT_FFMPEG", "2"))
+_ffmpeg_slots: Optional[asyncio.Semaphore] = None
+
+
+def _slots() -> asyncio.Semaphore:
+    global _ffmpeg_slots
+    if _ffmpeg_slots is None:
+        _ffmpeg_slots = asyncio.Semaphore(MAX_CONCURRENT_FFMPEG)
+    return _ffmpeg_slots
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 
@@ -79,25 +94,37 @@ async def _save_upload(upload: UploadFile, dst: Path) -> int:
     return size
 
 
-def _run_ffmpeg(args: List[str]) -> None:
-    """Invoke ffmpeg synchronously with a hard timeout."""
-    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", *args]
+async def _run_ffmpeg(args: List[str]) -> None:
+    """Run ffmpeg without blocking the event loop.
+
+    The old version called subprocess.run() inside async handlers, which froze
+    the whole server (including GET /health) for as long as ffmpeg ran. Render
+    stops routing to an instance after 15 s of failed health checks (502s) and
+    restarts it after 60 s (503s), which is why long clips always failed.
+    """
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-nostdin", "-loglevel", "error", *args]
     logger.info("ffmpeg %s", " ".join(cmd[1:]))
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
-            check=False,
+    async with _slots():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Audio processing timed out",
-        ) from exc
+        try:
+            _, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=FFMPEG_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise HTTPException(
+                status_code=504,
+                detail="Audio processing timed out",
+            ) from exc
 
     if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
         logger.error("ffmpeg failed: %s", stderr[-500:])
         raise HTTPException(
             status_code=422,
@@ -141,10 +168,12 @@ async def extract_audio(
         src = job / f"input{Path(file.filename or 'input').suffix or ''}"
         out = job / "extracted.mp3"
         await _save_upload(file, src)
-        _run_ffmpeg(
+        await _run_ffmpeg(
             [
                 "-i",
                 str(src),
+                "-map",
+                "0:a:0",            # first audio track only
                 "-vn",              # drop video
                 "-acodec",
                 "libmp3lame",
@@ -187,7 +216,7 @@ async def trim_audio(
         out = job / "trimmed.mp3"
         await _save_upload(file, src)
 
-        args: List[str] = ["-ss", f"{start}", "-i", str(src)]
+        args: List[str] = ["-ss", f"{start}", "-i", str(src), "-map", "0:a:0"]
         if end is not None:
             args += ["-t", f"{max(0.1, end - start)}"]
         args += [
@@ -202,7 +231,7 @@ async def trim_audio(
             "44100",
             str(out),
         ]
-        _run_ffmpeg(args)
+        await _run_ffmpeg(args)
         return _mp3_response(out, "soundbyte-trim.mp3", background, job)
     except HTTPException:
         _cleanup(job)
@@ -247,10 +276,12 @@ async def merge_audio(
         normalised: List[Path] = []
         for i, src in enumerate(saved):
             norm = job / f"norm-{i:02d}.mp3"
-            _run_ffmpeg(
+            await _run_ffmpeg(
                 [
                     "-i",
                     str(src),
+                    "-map",
+                    "0:a:0",
                     "-vn",
                     "-acodec",
                     "libmp3lame",
@@ -274,7 +305,7 @@ async def merge_audio(
                 f.write(f"file '{safe}'\n")
 
         out = job / "merged.mp3"
-        _run_ffmpeg(
+        await _run_ffmpeg(
             [
                 "-f",
                 "concat",
