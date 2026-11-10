@@ -1,0 +1,9 @@
+# The live site served the policy as text/plain, so browsers showed raw HTML.
+/*
+  X-Content-Type-Options: nosniff
+/
+  Content-Type: text/html; charset=UTF-8
+/privacy
+  Content-Type: text/html; charset=UTF-8
+/privacy/
+  Content-Type: text/html; charset=UTF-8

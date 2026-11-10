@@ -1,0 +1,4 @@
+# /privacy is served by privacy/index.html (Netlify pretty URLs).
+/privacy.html         /privacy   301
+/privacy-policy       /privacy   301
+/privacy-policy.html  /privacy   301
